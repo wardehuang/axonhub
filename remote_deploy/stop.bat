@@ -26,7 +26,7 @@ if not defined BASH_EXE (
 set "REPO_ROOT=%REPO_ROOT:\=/%"
 >> "%LOG_FILE%" echo Stopping AxonHub...
 echo Stopping AxonHub...
-"%BASH_EXE%" -lc "cd '%REPO_ROOT%' && bash remote_deploy/stop" >> "%LOG_FILE%" 2>&1
+"%BASH_EXE%" -lc "set -o pipefail; cd '%REPO_ROOT%' && bash remote_deploy/stop 2^>^&1 ^| tee -a remote_deploy/latest.log"
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if "%EXIT_CODE%"=="0" (
@@ -37,6 +37,5 @@ if "%EXIT_CODE%"=="0" (
   echo Stop failed with exit code %EXIT_CODE%.
 )
 >> "%LOG_FILE%" echo ==== AxonHub stop finished with exit code %EXIT_CODE% ====
-type "%LOG_FILE%"
 pause
 exit /b %EXIT_CODE%
