@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+if [[ $# -ne 1 ]]; then
+  printf 'Usage: %s {deploy|restart|stop}\n' "$0" >&2
+  exit 2
+fi
+
+case "$1" in
+deploy) TARGET="deploy" ;;
+restart) TARGET="restart" ;;
+stop) TARGET="stop" ;;
+*)
+  printf 'Unknown operation: %s\n' "$1" >&2
+  exit 2
+  ;;
+esac
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+LOG_FILE="$SCRIPT_DIR/latest.log"
+
+cd -- "$REPO_ROOT" || exit 1
+bash "$SCRIPT_DIR/$TARGET" 2>&1 | tee -a "$LOG_FILE"
+EXIT_CODE="${PIPESTATUS[0]}"
+exit "$EXIT_CODE"

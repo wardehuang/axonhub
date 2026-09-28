@@ -175,3 +175,4 @@ deploy_dev.sh
 !remote_deploy/deploy
 !remote_deploy/restart
 !remote_deploy/stop
+!remote_deploy/run_with_log
