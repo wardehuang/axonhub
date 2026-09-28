@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REMOTE_USER="${AXONHUB_REMOTE_USER:-ubuntu}"
+REMOTE_HOST="${AXONHUB_REMOTE_HOST:-163.192.9.157}"
+REMOTE_SSH_PORT="${AXONHUB_REMOTE_SSH_PORT:-27312}"
+SSH_KEY="${AXONHUB_SSH_KEY:-E:/Files/SSH Key/oracle-ssh-key-2026-05-16.key}"
+SERVICE_NAME="${AXONHUB_SERVICE_NAME:-axonhub}"
+APP_PORT="${AXONHUB_PORT:-18737}"
+REMOTE="${REMOTE_USER}@${REMOTE_HOST}"
+SSH_OPTS=(-i "$SSH_KEY" -p "$REMOTE_SSH_PORT" -o BatchMode=yes -o ConnectTimeout=15)
+
+if [[ ! -f "$SSH_KEY" ]]; then
+  printf 'SSH key not found: %s\n' "$SSH_KEY" >&2
+  exit 1
+fi
+
+ssh "${SSH_OPTS[@]}" "$REMOTE" bash -s -- "$SERVICE_NAME" "$APP_PORT" <<'REMOTE_SCRIPT'
+set -euo pipefail
+SERVICE_NAME="$1"
+APP_PORT="$2"
+
+sudo -n systemctl restart "$SERVICE_NAME.service"
+for _ in $(seq 1 60); do
+  if sudo -n systemctl is-active --quiet "$SERVICE_NAME.service" && curl -fsS --max-time 2 "http://127.0.0.1:${APP_PORT}/health" >/dev/null 2>&1; then
+    printf 'RESTART_OK service=%s port=%s\n' "$SERVICE_NAME" "$APP_PORT"
+    exit 0
+  fi
+  sleep 2
+done
+
+printf '%s\n' 'AxonHub did not become healthy after restart.' >&2
+sudo -n systemctl status "$SERVICE_NAME.service" --no-pager >&2 || true
+sudo -n journalctl -u "$SERVICE_NAME.service" -n 80 --no-pager >&2 || true
+exit 1
+REMOTE_SCRIPT

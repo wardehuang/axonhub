@@ -169,3 +169,9 @@ config.schema.json
 .ace-tool/
 .omx/
 deploy_dev.sh
+
+# Remote AxonHub deployment helpers
+!remote_deploy/
+!remote_deploy/deploy
+!remote_deploy/restart
+!remote_deploy/stop

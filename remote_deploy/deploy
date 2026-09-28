@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REMOTE_USER="${AXONHUB_REMOTE_USER:-ubuntu}"
+REMOTE_HOST="${AXONHUB_REMOTE_HOST:-163.192.9.157}"
+REMOTE_SSH_PORT="${AXONHUB_REMOTE_SSH_PORT:-27312}"
+SSH_KEY="${AXONHUB_SSH_KEY:-E:/Files/SSH Key/oracle-ssh-key-2026-05-16.key}"
+REMOTE_ROOT="${AXONHUB_REMOTE_ROOT:-/opt/axonhub}"
+SERVICE_NAME="${AXONHUB_SERVICE_NAME:-axonhub}"
+APP_PORT="${AXONHUB_PORT:-18737}"
+DEPLOY_BRANCH="my-feature"
+REMOTE="${REMOTE_USER}@${REMOTE_HOST}"
+SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=15)
+SSH_PORT_OPTS=(-p "$REMOTE_SSH_PORT")
+SCP_PORT_OPTS=(-P "$REMOTE_SSH_PORT")
+
+if [[ ! -f "$SSH_KEY" ]]; then
+  printf 'SSH key not found: %s\n' "$SSH_KEY" >&2
+  exit 1
+fi
+
+CURRENT_BRANCH="$(git branch --show-current)"
+if [[ "$CURRENT_BRANCH" != "$DEPLOY_BRANCH" ]]; then
+  printf 'Deployment must run from branch %s; current branch is %s.\n' "$DEPLOY_BRANCH" "$CURRENT_BRANCH" >&2
+  exit 1
+fi
+if ! git show-ref --verify --quiet "refs/heads/$DEPLOY_BRANCH"; then
+  printf 'Local branch not found: %s\n' "$DEPLOY_BRANCH" >&2
+  exit 1
+fi
+
+if ! git diff --quiet --ignore-submodules HEAD || ! git diff --cached --quiet --ignore-submodules; then
+  printf '%s\n' 'Tracked changes exist. Commit them before deployment.' >&2
+  git status --short --branch >&2
+  exit 1
+fi
+
+COMMIT="$(git rev-parse "$DEPLOY_BRANCH")"
+VERSION="$(git describe --tags --exact-match "$COMMIT" 2>/dev/null || git describe --tags --always "$COMMIT")"
+BUILD_TIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+ARCHIVE="$(mktemp "${TMPDIR:-/tmp}/axonhub-source.XXXXXX.tar.gz")"
+trap 'rm -f "$ARCHIVE"' EXIT
+
+printf 'Preparing branch=%s version=%s (%s)\n' "$DEPLOY_BRANCH" "$VERSION" "$COMMIT"
+git archive --format=tar.gz --prefix=axonhub-source/ "$DEPLOY_BRANCH" > "$ARCHIVE"
+
+for member in go.mod go.sum llm/go.mod frontend/package.json frontend/pnpm-lock.yaml; do
+  if tar -xOzf "$ARCHIVE" "axonhub-source/$member" | LC_ALL=C grep -q $'\r'; then
+    printf 'CRLF detected in archive member: %s\n' "$member" >&2
+    exit 1
+  fi
+done
+
+ARCHIVE_SHA256="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+REMOTE_ARCHIVE="/tmp/axonhub-${COMMIT}.tar.gz"
+
+printf 'Uploading source archive to %s\n' "$REMOTE"
+scp "${SCP_PORT_OPTS[@]}" "${SSH_OPTS[@]}" "$ARCHIVE" "$REMOTE:$REMOTE_ARCHIVE"
+
+ssh "${SSH_OPTS[@]}" "${SSH_PORT_OPTS[@]}" "$REMOTE" bash -s -- \
+  "$REMOTE_ARCHIVE" \
+  "$ARCHIVE_SHA256" \
+  "$COMMIT" \
+  "$VERSION" \
+  "$BUILD_TIME" \
+  "$APP_PORT" \
+  "$REMOTE_ROOT" \
+  "$SERVICE_NAME" <<'REMOTE_SCRIPT'
+set -euo pipefail
+
+REMOTE_ARCHIVE="$1"
+EXPECTED_SHA256="$2"
+COMMIT="$3"
+VERSION="$4"
+BUILD_TIME="$5"
+APP_PORT="$6"
+REMOTE_ROOT="$7"
+SERVICE_NAME="$8"
+
+export PATH="/usr/local/go/bin:/usr/local/bin:$PATH"
+
+if ! sudo -n true; then
+  printf '%s\n' 'Passwordless sudo is required on the remote host.' >&2
+  exit 1
+fi
+
+ACTUAL_SHA256="$(sha256sum "$REMOTE_ARCHIVE" | awk '{print $1}')"
+if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
+  printf 'Archive checksum mismatch: expected %s, got %s\n' "$EXPECTED_SHA256" "$ACTUAL_SHA256" >&2
+  exit 1
+fi
+
+case "$(uname -m)" in
+aarch64|arm64) TARGET_ARCH=arm64 ;;
+x86_64|amd64) TARGET_ARCH=amd64 ;;
+*) printf 'Unsupported remote architecture: %s\n' "$(uname -m)" >&2; exit 1 ;;
+esac
+
+if ! getent group axonhub >/dev/null 2>&1; then
+  sudo -n groupadd --system axonhub
+fi
+if ! id -u axonhub >/dev/null 2>&1; then
+  sudo -n useradd --system --gid axonhub --home-dir "$REMOTE_ROOT" --shell /usr/sbin/nologin axonhub
+fi
+
+sudo -n install -d -o root -g root -m 0755 "$REMOTE_ROOT"
+sudo -n install -d -o root -g root -m 0755 "$REMOTE_ROOT/releases" "$REMOTE_ROOT/backups"
+sudo -n install -d -o axonhub -g axonhub -m 0750 "$REMOTE_ROOT/data" "$REMOTE_ROOT/logs"
+sudo -n install -d -o root -g root -m 0755 /etc/axonhub
+
+STAGE="$(mktemp -d "/tmp/axonhub-build-${COMMIT}.XXXXXX")"
+trap 'rm -rf "$STAGE" "$REMOTE_ARCHIVE"' EXIT
+tar -xzf "$REMOTE_ARCHIVE" -C "$STAGE" --strip-components=1
+cd "$STAGE"
+
+go version
+pnpm --version
+pnpm --dir frontend install --frozen-lockfile
+pnpm --dir frontend build
+rm -rf internal/server/static/dist
+install -d internal/server/static/dist
+cp -a frontend/dist/. internal/server/static/dist/
+
+LDFLAGS="-s -w -X github.com/looplj/axonhub/internal/build.Version=${VERSION} -X github.com/looplj/axonhub/internal/build.Commit=${COMMIT} -X github.com/looplj/axonhub/internal/build.BuildTime=${BUILD_TIME}"
+GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_ARCH" \
+  go build -tags=nomsgpack -ldflags "$LDFLAGS" -o "$STAGE/axonhub" ./cmd/axonhub
+
+if [[ ! -x "$STAGE/axonhub" ]]; then
+  printf '%s\n' 'Build did not produce an executable.' >&2
+  exit 1
+fi
+
+BACKUP_STAMP="$(date -u '+%Y%m%dT%H%M%SZ')"
+RELEASE_DIR="$REMOTE_ROOT/releases/${COMMIT}-${BACKUP_STAMP}"
+PREVIOUS_TARGET=""
+if [[ -L "$REMOTE_ROOT/current" ]]; then
+  PREVIOUS_TARGET="$(readlink "$REMOTE_ROOT/current")"
+elif [[ -e "$REMOTE_ROOT/current" ]]; then
+  printf '%s\n' "$REMOTE_ROOT/current exists and is not a symlink; refusing to replace it." >&2
+  exit 1
+fi
+
+BACKUP_DIR="$REMOTE_ROOT/backups/${BACKUP_STAMP}-${COMMIT}"
+sudo -n install -d -o root -g root -m 0750 "$BACKUP_DIR"
+if [[ -e "$REMOTE_ROOT/current/axonhub" ]]; then
+  sudo -n cp -a "$REMOTE_ROOT/current/axonhub" "$BACKUP_DIR/axonhub"
+fi
+if [[ -f "$REMOTE_ROOT/config.yml" ]]; then
+  sudo -n cp -a "$REMOTE_ROOT/config.yml" "$BACKUP_DIR/config.yml"
+fi
+DATA_ENTRY="$(sudo -n find "$REMOTE_ROOT/data" -mindepth 1 -print -quit)"
+if [[ -n "$DATA_ENTRY" ]]; then
+  sudo -n tar -czf "$BACKUP_DIR/data.tar.gz" -C "$REMOTE_ROOT" data
+fi
+if [[ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]]; then
+  sudo -n cp -a "/etc/systemd/system/${SERVICE_NAME}.service" "$BACKUP_DIR/${SERVICE_NAME}.service"
+fi
+if [[ -f /etc/axonhub/axonhub.env ]]; then
+  sudo -n cp -a /etc/axonhub/axonhub.env "$BACKUP_DIR/axonhub.env"
+fi
+
+sudo -n install -d -o axonhub -g axonhub -m 0755 "$RELEASE_DIR"
+sudo -n install -o axonhub -g axonhub -m 0755 "$STAGE/axonhub" "$RELEASE_DIR/axonhub"
+
+if [[ ! -f "$REMOTE_ROOT/config.yml" ]]; then
+  sudo -n tee "$REMOTE_ROOT/config.yml" >/dev/null <<CONFIG
+server:
+  host: "0.0.0.0"
+  port: ${APP_PORT}
+db:
+  dialect: "sqlite3"
+  dsn: "file:${REMOTE_ROOT}/data/axonhub.db?cache=shared&_fk=1&_pragma=journal_mode(WAL)"
+log:
+  output: "stdio"
+CONFIG
+  sudo -n chown axonhub:axonhub "$REMOTE_ROOT/config.yml"
+  sudo -n chmod 0640 "$REMOTE_ROOT/config.yml"
+fi
+
+if [[ ! -f /etc/axonhub/axonhub.env ]]; then
+  sudo -n tee /etc/axonhub/axonhub.env >/dev/null <<ENV
+AXONHUB_SERVER_HOST=0.0.0.0
+AXONHUB_SERVER_PORT=${APP_PORT}
+AXONHUB_DB_DIALECT=sqlite3
+AXONHUB_DB_DSN=file:${REMOTE_ROOT}/data/axonhub.db?cache=shared&_fk=1&_pragma=journal_mode(WAL)
+ENV
+  sudo -n chown root:root /etc/axonhub/axonhub.env
+  sudo -n chmod 0600 /etc/axonhub/axonhub.env
+fi
+
+sudo -n tee "/etc/systemd/system/${SERVICE_NAME}.service" >/dev/null <<UNIT
+[Unit]
+Description=AxonHub AI Gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=axonhub
+Group=axonhub
+WorkingDirectory=${REMOTE_ROOT}
+EnvironmentFile=-/etc/axonhub/axonhub.env
+ExecStart=${REMOTE_ROOT}/current/axonhub
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo -n chown root:root "/etc/systemd/system/${SERVICE_NAME}.service"
+sudo -n chmod 0644 "/etc/systemd/system/${SERVICE_NAME}.service"
+sudo -n systemctl daemon-reload
+if ! command -v ufw >/dev/null 2>&1; then
+  printf '%s\n' 'ufw is required to open the AxonHub port.' >&2
+  exit 1
+fi
+sudo -n ufw allow "${APP_PORT}/tcp" comment "AxonHub" >/dev/null
+
+if sudo -n systemctl is-active --quiet "$SERVICE_NAME.service"; then
+  sudo -n systemctl stop "$SERVICE_NAME.service"
+fi
+sudo -n ln -sfnT "$RELEASE_DIR" "$REMOTE_ROOT/current"
+sudo -n systemctl enable "$SERVICE_NAME.service" >/dev/null
+
+rollback() {
+  sudo -n systemctl stop "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+  if [[ -n "$PREVIOUS_TARGET" ]]; then
+    sudo -n ln -sfnT "$PREVIOUS_TARGET" "$REMOTE_ROOT/current"
+    sudo -n systemctl start "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+  fi
+}
+
+if ! sudo -n systemctl start "$SERVICE_NAME.service"; then
+  printf '%s\n' 'AxonHub failed to start; attempting rollback.' >&2
+  rollback
+  sudo -n journalctl -u "$SERVICE_NAME.service" -n 80 --no-pager >&2 || true
+  exit 1
+fi
+
+HEALTH_JSON=""
+for _ in $(seq 1 60); do
+  if sudo -n systemctl is-active --quiet "$SERVICE_NAME.service"; then
+    if HEALTH_JSON="$(curl -fsS --max-time 2 "http://127.0.0.1:${APP_PORT}/health" 2>/dev/null)"; then
+      break
+    fi
+  fi
+  HEALTH_JSON=""
+  sleep 2
+done
+
+if [[ -z "$HEALTH_JSON" ]]; then
+  printf '%s\n' 'AxonHub did not become healthy; attempting rollback.' >&2
+  rollback
+  sudo -n journalctl -u "$SERVICE_NAME.service" -n 80 --no-pager >&2 || true
+  exit 1
+fi
+
+ACTUAL_VERSION="$(printf '%s' "$HEALTH_JSON" | jq -r '.build.version')"
+ACTUAL_COMMIT="$(printf '%s' "$HEALTH_JSON" | jq -r '.build.commit')"
+if [[ "$ACTUAL_VERSION" != "$VERSION" || "$ACTUAL_COMMIT" != "$COMMIT" ]]; then
+  printf 'Build identity mismatch: expected %s/%s, got %s/%s\n' "$VERSION" "$COMMIT" "$ACTUAL_VERSION" "$ACTUAL_COMMIT" >&2
+  rollback
+  exit 1
+fi
+
+printf 'DEPLOY_OK version=%s commit=%s port=%s backup=%s\n' "$ACTUAL_VERSION" "$ACTUAL_COMMIT" "$APP_PORT" "$BACKUP_DIR"
+REMOTE_SCRIPT
+
+printf '%s\n' 'Remote deployment completed.'
